@@ -31,7 +31,7 @@ def main():
     ap.add_argument("--db", default=DB_PATH)
     args = ap.parse_args()
 
-    model = SentenceTransformer(EMBED_MODEL, device="cuda")
+    model = SentenceTransformer(EMBED_MODEL, device=os.environ.get("EMBED_DEVICE", "cuda"))
     dim = model.get_sentence_embedding_dimension()
     print(f"model: {EMBED_MODEL} ({dim}d) on {model.device}")
 

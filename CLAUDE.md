@@ -75,7 +75,7 @@ PMID skips duplicates, and only `embedded=0` rows are re-embedded.
 | `QDRANT_COLLECTION` | `pubmed_ovarian` | embed + core |
 | `QDRANT_CHUNK_COLLECTION` | `pubmed_ovarian_chunks` | pmc_embed + core_v2 |
 | `EMBED_MODEL` | `NeuML/pubmedbert-base-embeddings` | embed + core |
-| `EMBED_DEVICE` | `cuda` | core, pmc_embed (**not** pubmed_embed) |
+| `EMBED_DEVICE` | `cuda` | core, pubmed_embed, pmc_embed |
 | `OLLAMA_URL` / `OLLAMA_MODEL` | `localhost:11434` / `nemotron-3-nano` | core |
 | `TOP_K` / `MAX_PER_PAPER` | `8` / `2` | core |
 
@@ -103,19 +103,24 @@ PMID skips duplicates, and only `embedded=0` rows are re-embedded.
    `pubmed_core`, which is the abstracts-only v1. If you ingested and embedded
    PMC chunks but answers still only cite abstracts, it's almost always because
    `pubmed_core.py` was never replaced with `pubmed_core_v2.py`.
-3. **`pmc_ingest.py` PMCID parsing is the prime suspect for "no full text."**
-   `fetch_fulltext()` reads the PMCID from `article-id` using keys `"pmcid"`/
-   `"pmcaid"`, but PMC JATS tags it `pub-id-type="pmc"`. When the key doesn't
-   match, the article is silently skipped and **zero chunks are written** — while
-   `pmc_map` still records the PMID, so re-runs never retry it. Symptom: PMC
-   coverage percentage prints fine but "chunks so far" stays 0. Verify with
-   `SELECT COUNT(*) FROM chunks;` before assuming full text is present.
+3. **`pmc_ingest.py` full text hinges on the PMCID key.** `fetch_fulltext()`
+   now reads the PMCID from `article-id` under `pub-id-type="pmc"` (PMC JATS's
+   actual tag), with `"pmcid"`/`"pmcaid"` kept only as fallbacks. Historically
+   it read the fallbacks alone, so every article was silently skipped and **zero
+   chunks were written** while `pmc_map` still recorded the PMID (so re-runs
+   never retried it). If you have old `pmc_map` rows from before the fix, clear
+   the stale ones (`DELETE FROM pmc_map WHERE pmid NOT IN (SELECT pmid FROM
+   chunks);`) and re-run. Sanity-check full text with `SELECT COUNT(*) FROM
+   chunks;` — if it's 0, no full text was ingested.
 4. **FTS5 query sanitization differs between files.** `pubmed_core_v2.py` quotes
    terms and requires an alphanumeric first char (`_fts_query`); the older
    `pubmed_core.py` and `pubmed_search.py` do not, so a query token with a
    leading `-` can raise `no such column` from FTS5.
-5. **`pubmed_embed.py` hardcodes `device="cuda"`** (ignores `EMBED_DEVICE`),
-   unlike the other embed/core files. It will crash on a CPU-only box.
+5. **`pubmed_ingest.py` `efetch()` retries transient NCBI drops.** NCBI
+   intermittently ends a response early (`ChunkedEncodingError`); `efetch()`
+   retries with exponential backoff, and the ingest loop skips a batch that
+   fails all retries rather than aborting. The run is resumable regardless —
+   each batch is committed — so re-running always makes forward progress.
 6. Very recent papers have empty `mesh_terms` (NCBI indexes them weeks later) —
    expected, not a bug.
 
