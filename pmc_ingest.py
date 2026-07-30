@@ -156,7 +156,9 @@ def fetch_fulltext(pmcids):
     result = {}
     for art in root.findall(".//article"):
         ids = {a.get("pub-id-type"): (a.text or "") for a in art.findall(".//article-id")}
-        pmcid = (ids.get("pmcid") or ids.get("pmcaid") or "").replace("PMC", "")
+        # PMC JATS tags the PMCID as pub-id-type="pmc". Keep the legacy keys as
+        # defensive fallbacks. Missing this key silently drops every article.
+        pmcid = (ids.get("pmc") or ids.get("pmcid") or ids.get("pmcaid") or "").replace("PMC", "")
         pmid = ids.get("pmid") or None
         if pmcid:
             result[(pmid, pmcid)] = parse_fulltext(art)

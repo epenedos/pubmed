@@ -180,15 +180,29 @@ def parse_article(art):
     )
 
 
-def efetch(pmids):
-    """Fetch a batch by explicit ID list. POST because the URL would be too long."""
-    r = requests.post(
-        f"{EUTILS}/efetch.fcgi",
-        data=params(id=",".join(pmids), retmode="xml"),
-        timeout=180,
-    )
-    r.raise_for_status()
-    root = ET.fromstring(r.text)
+def efetch(pmids, retries=4):
+    """Fetch a batch by explicit ID list. POST because the URL would be too long.
+
+    NCBI intermittently drops the connection mid-response (ChunkedEncodingError).
+    Retry with exponential backoff so a transient blip doesn't abort the whole run.
+    """
+    for attempt in range(retries):
+        try:
+            r = requests.post(
+                f"{EUTILS}/efetch.fcgi",
+                data=params(id=",".join(pmids), retmode="xml"),
+                timeout=180,
+            )
+            r.raise_for_status()
+            root = ET.fromstring(r.text)
+            break
+        except (requests.exceptions.RequestException, ET.ParseError) as e:
+            if attempt == retries - 1:
+                raise
+            wait = 2 ** attempt
+            print(f"  efetch failed ({type(e).__name__}); retry in {wait}s", flush=True)
+            time.sleep(wait)
+
     rows = []
     for art in root.findall("PubmedArticle"):
         parsed = parse_article(art)
@@ -220,7 +234,12 @@ def main():
 
     inserted = 0
     for start in range(0, len(pmids), BATCH):
-        rows = efetch(pmids[start : start + BATCH])
+        try:
+            rows = efetch(pmids[start : start + BATCH])
+        except Exception as e:
+            print(f"  batch at {start} failed after retries ({e}); skipping", flush=True)
+            polite_sleep()
+            continue
         conn.executemany(
             "INSERT OR IGNORE INTO articles "
             "(pmid,title,abstract,journal,year,authors,doi,pub_types,mesh_terms) "
