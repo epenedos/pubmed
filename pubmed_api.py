@@ -26,6 +26,10 @@ MODEL_ID = "pubmed-ovarian"
 
 app = FastAPI(title="PubMed RAG")
 
+# Load the embedding model (and reranker, if enabled) once at startup so the
+# first request isn't slow and concurrent requests share one copy.
+core.preload()
+
 
 class Message(BaseModel):
     role: str
