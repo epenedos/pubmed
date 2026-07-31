@@ -43,10 +43,11 @@ NCBI E-utilities ──► SQLite (pubmed.db) ──► Qdrant ──► retriev
 | 2 answer (CLI) | `pubmed_ask.py` → core | Qdrant + FTS5 + Ollama | stdout |
 | 3 answer (API) | `pubmed_api.py` → core | same | OpenAI-compatible HTTP |
 
-`pubmed_core.py` (abstracts only) and `pubmed_core_v2.py` (abstracts **and**
-chunks) are the shared retrieval/answer libraries. `pubmed_ask.py` and
-`pubmed_api.py` both `import pubmed_core`. **To use full text you must replace
-`pubmed_core.py` with `pubmed_core_v2.py`** — see the gotcha below.
+`pubmed_core.py` is the single shared retrieval/answer library — it searches
+abstracts **and** full-text chunks, and both `pubmed_ask.py` and `pubmed_api.py`
+`import pubmed_core`. (There is no longer a `pubmed_core_v2.py` or a file-swap
+step; the full-text core is the only core.) An optional cross-encoder reranker
+sits inside `retrieve()`, enabled with `RERANK=1`.
 
 ## Running it
 
@@ -78,6 +79,9 @@ PMID skips duplicates, and only `embedded=0` rows are re-embedded.
 | `EMBED_DEVICE` | `cuda` | core, pubmed_embed, pmc_embed |
 | `OLLAMA_URL` / `OLLAMA_MODEL` | `localhost:11434` / `nemotron-3-nano` | core |
 | `TOP_K` / `MAX_PER_PAPER` | `8` / `2` | core |
+| `RERANK` | `0` | core (`1` = cross-encoder rerank) |
+| `RERANK_MODEL` | `BAAI/bge-reranker-base` | core (when `RERANK=1`) |
+| `RERANK_CANDIDATES` | `50` | core (pool size rescored) |
 
 ## Conventions
 
@@ -99,10 +103,12 @@ PMID skips duplicates, and only `embedded=0` rows are re-embedded.
    absent and otherwise `upsert` (update-in-place). Stale vectors from a previous
    run therefore persist; if the corpus definition changes, drop the Qdrant
    collections manually.
-2. **Full text requires swapping the core file.** `ask`/`api` import
-   `pubmed_core`, which is the abstracts-only v1. If you ingested and embedded
-   PMC chunks but answers still only cite abstracts, it's almost always because
-   `pubmed_core.py` was never replaced with `pubmed_core_v2.py`.
+2. **Reranking is opt-in and self-contained.** `retrieve()` runs a cross-encoder
+   pass only when `RERANK=1`; otherwise behaviour is the plain fused ranking. The
+   reranker model loads lazily (and is preloaded by `pubmed_api.py`), and if it
+   fails to load, retrieval falls back to the fused order rather than erroring —
+   so a bad `RERANK_MODEL` degrades quality but never breaks answering. (There is
+   no longer a v1/v2 core split or a file-swap step to forget.)
 3. **`pmc_ingest.py` full text hinges on the PMCID key.** `fetch_fulltext()`
    now reads the PMCID from `article-id` under `pub-id-type="pmc"` (PMC JATS's
    actual tag), with `"pmcid"`/`"pmcaid"` kept only as fallbacks. Historically
@@ -133,8 +139,11 @@ Retrieval quality is the ceiling on answer quality. When an answer is thin or
    `SELECT COUNT(*) FROM chunks;` (chunks == 0 means full text never ingested —
    see gotcha 3).
 2. Check vectors exist: Qdrant collection counts should match the DB row counts.
-3. Check which core is imported (gotcha 2) — chunks are only searched by v2.
-4. Print the retrieved PMIDs (the CLI does this) before blaming the model.
+3. Print the retrieved sources (the CLI marks full-text hits with `*`) before
+   blaming the model — thin answers are usually a retrieval miss, not the LLM.
+4. If precise passages aren't surfacing, try `RERANK=1` (cross-encoder) and/or
+   a larger `OLLAMA_MODEL`; retrieval precision and model size are the two
+   ceilings on answer quality.
 
 ## Git / workflow
 

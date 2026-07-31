@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-Phase 2 core — retrieval + grounded answering.
+RAG core — retrieval over abstracts + PMC full-text chunks, and grounded answering.
 
-Shared by the CLI (pubmed_ask.py) and the API server (pubmed_api.py).
-Heavy objects (embedding model, clients) are loaded once and reused.
+Shared by the CLI (pubmed_ask.py) and the API server (pubmed_api.py). Heavy
+objects (embedding model, reranker, clients) are loaded once and reused.
+
+Retrieval is hybrid (semantic + FTS5 keyword, over both abstracts and full-text
+chunks) fused with reciprocal rank fusion. An optional cross-encoder reranker
+(enable with RERANK=1) rescores a wide candidate pool so the single most
+relevant passage — often one methods sentence buried among hundreds of
+thousands of chunks — surfaces to the top before the per-paper cap is applied.
 """
 import os
 import re
 import sqlite3
+import threading
 from functools import lru_cache
 
 import requests
@@ -15,33 +22,45 @@ import requests
 DB_PATH = os.environ.get("PUBMED_DB", "pubmed.db")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 COLLECTION = os.environ.get("QDRANT_COLLECTION", "pubmed_ovarian")
+CHUNK_COLLECTION = os.environ.get("QDRANT_CHUNK_COLLECTION", "pubmed_ovarian_chunks")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "NeuML/pubmedbert-base-embeddings")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "nemotron-3-nano")
 TOP_K = int(os.environ.get("TOP_K", "8"))
+MAX_PER_PAPER = int(os.environ.get("MAX_PER_PAPER", "2"))
+
+# Optional cross-encoder reranking. Off by default so behaviour is unchanged
+# unless explicitly enabled; the model downloads on first use.
+RERANK = os.environ.get("RERANK", "0") == "1"
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-base")
+RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATES", "50"))
 
 SYSTEM_PROMPT = """You are a biomedical literature assistant. You answer \
-questions using ONLY the PubMed abstracts provided in the context below.
+questions using ONLY the sources provided in the context below.
 
 Rules:
 - Every factual claim must cite its source as [PMID: 12345678]. Multiple \
 sources for one claim: [PMID: 111, PMID: 222].
-- If the abstracts do not answer the question, say so plainly. Do not fill \
-gaps from your own knowledge, and never invent a PMID.
+- If the sources do not answer the question, say so plainly. Do not fill gaps \
+from your own knowledge, and never invent a PMID.
+- Sources marked FULL TEXT are excerpts from the paper itself; those marked \
+ABSTRACT are summaries only. Prefer full-text detail for methods and numbers.
 - Distinguish study types when it matters: a randomised trial, a retrospective \
 cohort, and a case report carry different weight. Note sample sizes when given.
-- Where the abstracts disagree, present the disagreement rather than picking a side.
+- Where sources disagree, present the disagreement rather than picking a side.
 - Be concise and factual. No hedging boilerplate.
 - You summarise published research. You do not give medical advice or \
 treatment recommendations for any individual."""
+
+_embed_lock = threading.Lock()
+_rerank_lock = threading.Lock()
 
 
 @lru_cache(maxsize=1)
 def _embedder():
     from sentence_transformers import SentenceTransformer
 
-    device = os.environ.get("EMBED_DEVICE", "cuda")
-    return SentenceTransformer(EMBED_MODEL, device=device)
+    return SentenceTransformer(EMBED_MODEL, device=os.environ.get("EMBED_DEVICE", "cuda"))
 
 
 @lru_cache(maxsize=1)
@@ -51,15 +70,63 @@ def _qdrant():
     return QdrantClient(url=QDRANT_URL)
 
 
-def semantic_search(query, k):
-    vec = _embedder().encode(query, normalize_embeddings=True).tolist()
-    hits = _qdrant().query_points(COLLECTION, query=vec, limit=k, with_payload=True).points
-    return [(h.payload["pmid"], h.payload) for h in hits]
+@lru_cache(maxsize=1)
+def _reranker():
+    from sentence_transformers import CrossEncoder
+
+    return CrossEncoder(RERANK_MODEL, device=os.environ.get("EMBED_DEVICE", "cuda"))
 
 
-def keyword_search(query, k, db=DB_PATH):
-    terms = re.findall(r"[A-Za-z0-9-]{3,}", query)
+def preload():
+    """Load the heavy models at startup so the first request isn't slow, and so
+    two concurrent requests don't each load their own copy."""
+    _embedder()
+    _qdrant()
+    if RERANK:
+        _reranker()
+
+
+def embed(text):
+    with _embed_lock:
+        return _embedder().encode(text, normalize_embeddings=True).tolist()
+
+
+# --------------------------------------------------------------------------
+# retrieval
+# --------------------------------------------------------------------------
+
+def _fts_query(query, max_terms=40):
+    """Build a safe FTS5 MATCH string.
+
+    Terms must start alphanumeric and are quoted, otherwise FTS5 reads a
+    leading '-' as a column filter and raises 'no such column'.
+    """
+    terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9-]{2,}", query)
     if not terms:
+        return None
+    return " OR ".join('"' + t.replace('"', "") + '"' for t in terms[:max_terms])
+
+
+def semantic_abstracts(query, k):
+    hits = _qdrant().query_points(
+        COLLECTION, query=embed(query), limit=k, with_payload=True
+    ).points
+    return [(f"a:{h.payload['pmid']}", {**h.payload, "kind": "abstract"}) for h in hits]
+
+
+def semantic_chunks(query, k):
+    try:
+        hits = _qdrant().query_points(
+            CHUNK_COLLECTION, query=embed(query), limit=k, with_payload=True
+        ).points
+    except Exception:
+        return []                       # collection may not exist yet
+    return [(f"c:{h.id}", {**h.payload, "kind": "fulltext"}) for h in hits]
+
+
+def keyword_abstracts(query, k, db=DB_PATH):
+    fts = _fts_query(query)
+    if not fts:
         return []
     conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
@@ -68,85 +135,171 @@ def keyword_search(query, k, db=DB_PATH):
             "SELECT a.pmid, a.title, a.abstract, a.journal, a.year, a.doi "
             "FROM articles_fts f JOIN articles a ON a.rowid = f.rowid "
             "WHERE articles_fts MATCH ? ORDER BY rank LIMIT ?",
-            (" OR ".join(terms), k),
+            (fts, k),
         ).fetchall()
+    except sqlite3.OperationalError:
+        return []
     finally:
         conn.close()
-    return [(r["pmid"], dict(r)) for r in rows]
+    return [(f"a:{r['pmid']}", {**dict(r), "kind": "abstract"}) for r in rows]
+
+
+def keyword_chunks(query, k, db=DB_PATH):
+    fts = _fts_query(query)
+    if not fts:
+        return []
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT c.id, c.pmid, c.pmcid, c.section, c.text, "
+            "       a.title, a.journal, a.year, a.doi "
+            "FROM chunks_fts f JOIN chunks c ON c.id = f.rowid "
+            "LEFT JOIN articles a ON a.pmid = c.pmid "
+            "WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
+            (fts, k),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []                       # chunks table may not exist yet
+    finally:
+        conn.close()
+    return [(f"c:{r['id']}", {**dict(r), "kind": "fulltext"}) for r in rows]
 
 
 def fuse(*ranked_lists, k=60):
-    """Reciprocal rank fusion of independent ranked lists."""
+    """Reciprocal rank fusion over lists of (key, payload)."""
     scores, payloads = {}, {}
     for lst in ranked_lists:
-        for rank, (pmid, payload) in enumerate(lst):
-            scores[pmid] = scores.get(pmid, 0) + 1 / (k + rank + 1)
-            payloads.setdefault(pmid, payload)
+        for rank, (key, payload) in enumerate(lst):
+            scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
+            payloads.setdefault(key, payload)
     return [
-        (pmid, scores[pmid], payloads[pmid])
-        for pmid in sorted(scores, key=scores.get, reverse=True)
+        (key, scores[key], payloads[key])
+        for key in sorted(scores, key=scores.get, reverse=True)
     ]
 
 
-def retrieve(question, top_k=TOP_K, db=DB_PATH):
-    return fuse(
-        semantic_search(question, top_k * 3),
-        keyword_search(question, top_k * 3, db),
-    )[:top_k]
+def _passage_text(payload):
+    """The text a reranker (or the model) should judge for this result."""
+    body = payload.get("text") or payload.get("abstract") or ""
+    title = payload.get("title") or ""
+    return (f"{title}\n{body}" if title else body).strip()
 
+
+def rerank(question, ranked, candidates=RERANK_CANDIDATES):
+    """Rescore the top `candidates` fused results with a cross-encoder.
+
+    A cross-encoder reads (question, passage) jointly, so it is far more precise
+    than the bi-encoder used for retrieval — but too slow to run over the whole
+    corpus, hence retrieve-wide-then-rerank. Falls back to the fused order if
+    the model can't be loaded, so reranking never breaks answering.
+    """
+    pool = ranked[:candidates]
+    if not pool:
+        return ranked
+    try:
+        with _rerank_lock:
+            pairs = [(question, _passage_text(p)[:2000]) for _, _, p in pool]
+            scores = _reranker().predict(pairs)
+    except Exception as e:
+        print(f"[rerank disabled: {type(e).__name__}: {e}]", flush=True)
+        return ranked
+    order = sorted(range(len(pool)), key=lambda i: scores[i], reverse=True)
+    reranked = [(pool[i][0], float(scores[i]), pool[i][2]) for i in order]
+    return reranked + ranked[candidates:]
+
+
+def retrieve(question, top_k=TOP_K, db=DB_PATH, max_per_paper=MAX_PER_PAPER):
+    # Retrieve a wide candidate pool; widen further when reranking so the
+    # cross-encoder has enough to work with.
+    wide = max(top_k * 3, RERANK_CANDIDATES if RERANK else 0)
+    ranked = fuse(
+        semantic_abstracts(question, wide),
+        semantic_chunks(question, wide),
+        keyword_abstracts(question, wide, db),
+        keyword_chunks(question, wide, db),
+    )
+
+    if RERANK and ranked:
+        ranked = rerank(question, ranked)
+
+    # Stop one heavily-chunked paper from crowding out everything else.
+    seen, out = {}, []
+    for key, score, payload in ranked:
+        pmid = payload.get("pmid")
+        if seen.get(pmid, 0) >= max_per_paper:
+            continue
+        seen[pmid] = seen.get(pmid, 0) + 1
+        out.append((key, score, payload))
+        if len(out) >= top_k:
+            break
+    return out
+
+
+# --------------------------------------------------------------------------
+# prompting
+# --------------------------------------------------------------------------
 
 def build_context(results, max_chars=1400):
-    """Format retrieved abstracts as the model's evidence block."""
     blocks = []
     for _, _, p in results:
-        abstract = p["abstract"]
-        if len(abstract) > max_chars:
-            abstract = abstract[:max_chars].rsplit(" ", 1)[0] + " [...]"
+        body = p.get("text") or p.get("abstract") or ""
+        if len(body) > max_chars:
+            body = body[:max_chars].rsplit(" ", 1)[0] + " [...]"
+        kind = "FULL TEXT" if p.get("kind") == "fulltext" else "ABSTRACT"
+        section = f" — {p['section']}" if p.get("section") else ""
         blocks.append(
-            f"[PMID: {p['pmid']}] {p['title']}\n"
-            f"{p.get('journal') or 'n/a'}, {p.get('year') or 'n/a'}\n"
-            f"{abstract}"
+            f"[PMID: {p.get('pmid')}] ({kind}{section}) {p.get('title')}\n"
+            f"{p.get('journal') or 'n/a'}, {p.get('year') or 'n/a'}\n{body}"
         )
     return "\n\n---\n\n".join(blocks)
 
 
 def build_messages(question, results, history=None):
-    context = build_context(results)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
         messages.extend(history)
     messages.append(
         {
             "role": "user",
-            "content": f"Context abstracts:\n\n{context}\n\n---\n\nQuestion: {question}",
+            "content": f"Context sources:\n\n{build_context(results)}\n\n"
+                       f"---\n\nQuestion: {question}",
         }
     )
     return messages
 
 
 def sources_markdown(results):
-    lines = ["\n\n---\n**Sources**\n"]
+    lines, seen = ["\n\n---\n**Sources**\n"], set()
     for _, _, p in results:
-        year = p.get("year") or "n.d."
-        journal = p.get("journal") or ""
+        pmid = p.get("pmid")
+        if not pmid or pmid in seen:
+            continue
+        seen.add(pmid)
+        tag = " *(full text)*" if p.get("kind") == "fulltext" else ""
         lines.append(
-            f"- [{p['pmid']}](https://pubmed.ncbi.nlm.nih.gov/{p['pmid']}/) — "
-            f"{p['title']} *({journal} {year})*"
+            f"- [{pmid}](https://pubmed.ncbi.nlm.nih.gov/{pmid}/) — "
+            f"{p.get('title')} *({p.get('journal') or ''} {p.get('year') or 'n.d.'})*{tag}"
         )
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# generation
+# --------------------------------------------------------------------------
+
 def chat_ollama(messages, stream=False, model=OLLAMA_MODEL):
-    """Call Ollama. Returns a string, or a generator of chunks when streaming."""
     payload = {
         "model": model,
         "messages": messages,
         "stream": stream,
+        "think": False,
         "options": {"temperature": 0.2, "num_ctx": 32768},
     }
     if not stream:
         r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=600)
-        r.raise_for_status()
+        if r.status_code != 200:
+            raise RuntimeError(f"Ollama {r.status_code}: {r.text[:300]}")
         return r.json()["message"]["content"]
 
     def gen():
@@ -155,12 +308,13 @@ def chat_ollama(messages, stream=False, model=OLLAMA_MODEL):
         with requests.post(
             f"{OLLAMA_URL}/api/chat", json=payload, stream=True, timeout=600
         ) as r:
-            r.raise_for_status()
+            if r.status_code != 200:
+                raise RuntimeError(f"Ollama {r.status_code}: {r.text[:300]}")
             for line in r.iter_lines():
                 if not line:
                     continue
                 data = json.loads(line)
-                chunk = data.get("message", {}).get("content", "")
+                chunk = (data.get("message") or {}).get("content") or ""
                 if chunk:
                     yield chunk
                 if data.get("done"):
@@ -170,9 +324,8 @@ def chat_ollama(messages, stream=False, model=OLLAMA_MODEL):
 
 
 def answer(question, top_k=TOP_K, db=DB_PATH, model=OLLAMA_MODEL):
-    """Non-streaming convenience wrapper: returns (text, results)."""
     results = retrieve(question, top_k, db)
     if not results:
-        return "No matching abstracts in the corpus for that question.", []
+        return "No matching sources in the corpus for that question.", []
     text = chat_ollama(build_messages(question, results), model=model)
     return text + sources_markdown(results), results

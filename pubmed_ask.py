@@ -17,8 +17,12 @@ def ask(question, k, model):
     if not results:
         print("No matching abstracts in the corpus.")
         return
-    print(f"\n[retrieved {len(results)} abstracts: "
-          f"{', '.join(p['pmid'] for _, _, p in results)}]\n")
+    n_full = sum(p.get("kind") == "fulltext" for _, _, p in results)
+    tags = ", ".join(
+        f"{p['pmid']}{'*' if p.get('kind') == 'fulltext' else ''}"
+        for _, _, p in results
+    )
+    print(f"\n[retrieved {len(results)} sources ({n_full} full text*): {tags}]\n")
     for chunk in core.chat_ollama(core.build_messages(question, results),
                                   stream=True, model=model):
         sys.stdout.write(chunk)
